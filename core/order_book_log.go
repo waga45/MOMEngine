@@ -2,9 +2,10 @@ package core
 
 import (
 	"MOMEngine/protocol"
-	"github.com/quagmt/udecimal"
 	"sync"
 	"time"
+
+	"github.com/quagmt/udecimal"
 )
 
 type OrderBookLog struct {
@@ -23,7 +24,7 @@ type OrderBookLog struct {
 	PreSize      string             `json:"preSize"`
 	MakerOrderId string             `json:"makerOrderId"`
 	MakerUserId  int64              `json:"makerUserId"`
-	RejectReason string             `json:"rejectReason"`
+	RejectReason int32              `json:"rejectReason"`
 	Timestamp    int64              `json:"timestamp"`
 	CreateTime   time.Time          `json:"createTime"`
 }
@@ -42,6 +43,12 @@ var logPool = sync.Pool{
 		return &OrderBookLog{}
 	},
 }
+var logSlicePool = sync.Pool{
+	New: func() any {
+		temp := make([]*OrderBookLog, 0, 8)
+		return &temp
+	},
+}
 
 func getOrderBookLog() *OrderBookLog {
 	return logPool.Get().(*OrderBookLog)
@@ -49,6 +56,15 @@ func getOrderBookLog() *OrderBookLog {
 func releaseOrderBookLog(l *OrderBookLog) {
 	*l = OrderBookLog{}
 	logPool.Put(l)
+}
+
+func acquireLogSlice() *[]*OrderBookLog {
+	return logSlicePool.Get().(*[]*OrderBookLog)
+}
+func releaseLogSlice(l *[]*OrderBookLog) {
+	temp := *l
+	*l = temp[:0]
+	logSlicePool.Put(l)
 }
 func NewMemoryLog() *MemoryLog {
 	return &MemoryLog{
@@ -148,7 +164,7 @@ func NewAmendLog(seqID int64, marketID string, orderID string, userID int64, sid
 	return log
 }
 
-func NewRejectLog(seqID int64, marketID string, orderID string, userID int64, reason string, timestamp int64) *OrderBookLog {
+func NewRejectLog(seqID int64, marketID string, orderID string, userID int64, reason int32, timestamp int64) *OrderBookLog {
 	log := getOrderBookLog()
 	log.SeqId = seqID
 	log.Type = protocol.LogTypeReject

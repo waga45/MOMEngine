@@ -155,3 +155,11 @@ const (
 	LogTypeAmend  LogType = 3
 	LogTypeReject LogType = 4
 )
+
+type ReasonCode int32
+
+const (
+	ReasonUnknown        ReasonCode = -1
+	ReasonInvalidPayload            = 100
+	ReasonStateHadDone              = 101
+)

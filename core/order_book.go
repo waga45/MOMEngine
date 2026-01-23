@@ -2,9 +2,11 @@ package core
 
 import (
 	"MOMEngine/protocol"
-	"github.com/quagmt/udecimal"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/quagmt/udecimal"
 )
 
 // 订单缓存池
@@ -81,5 +83,37 @@ func NewOrderBook(marketId string, tradeLog PushLog, opts ...OrderBookOption) *O
 
 // process event
 func (b *OrderBook) OnEvent(e *protocol.InputEvent) {
+	if e.Cmd != nil {
+		b.processCmd(e.Cmd)
+		return
+	}
+}
 
+func (b *OrderBook) processCmd(cmd *protocol.Command) {
+	switch cmd.Type {
+	case protocol.CmdSuspendMarket:
+		payload := &protocol.SuspendMarketCommand{}
+		if err := b.serializer.Unmarshal(cmd.Payload, &payload); err != nil {
+			b.logRejectPayload("", payload.UserId, protocol.ReasonInvalidPayload, cmd.Metadata)
+			return
+		}
+	}
+}
+
+func (b *OrderBook) logRejectPayload(orderId string, userId int64, reasonCode int32, _ map[string]string) {
+	logs := acquireLogSlice()
+	log := NewRejectLog(b.seqId.Add(1), b.marketId, orderId, userId, reasonCode, time.Now().Unix())
+	*logs = append(*logs, log)
+	b.traderLog.Publish(*logs)
+	releaseOrderBookLog(log)
+	releaseLogSlice(logs)
+}
+
+// updates the order book state to Suspended.
+func (b *OrderBook) handleSuspendMarket(bean *protocol.SuspendMarketCommand) {
+	if b.state == protocol.OrderBookStop {
+		b.logRejectPayload("", bean.UserId, protocol.ReasonStateHadDone, nil)
+		return
+	}
+	b.state = protocol.OrderBookPause
 }
