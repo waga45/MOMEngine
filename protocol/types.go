@@ -159,7 +159,8 @@ const (
 type ReasonCode int32
 
 const (
-	ReasonUnknown        ReasonCode = -1
-	ReasonInvalidPayload            = 100
-	ReasonStateHadDone              = 101
+	ReasonUnknown          ReasonCode = -1
+	ReasonInvalidPayload              = 100
+	ReasonStateHadDone                = 101
+	ReasonDuplicateOrderID            = 102
 )

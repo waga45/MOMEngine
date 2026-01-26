@@ -2,6 +2,7 @@ package core
 
 import (
 	"MOMEngine/protocol"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,7 +32,7 @@ var cancelOrderCmdPool = sync.Pool{
 }
 
 // get order from pool
-func getOrder() *protocol.Order {
+func getOrderFromPool() *protocol.Order {
 	return orderPool.Get().(*protocol.Order)
 }
 
@@ -89,6 +90,21 @@ func (b *OrderBook) OnEvent(e *protocol.InputEvent) {
 	}
 }
 
+// 避免调用push拷贝一次对象
+func (b *OrderBook) EnqueueCommand(cmd *protocol.Command) error {
+	if b.shutDown.Load() {
+		return errors.New("order book is shutting down")
+	}
+	seq, slot := b.cmdBuffer.NextSeq()
+	if seq == protocol.NullIndex {
+		return errors.New("no slot")
+	}
+	slot.Cmd = cmd
+	b.cmdBuffer.Commit(seq)
+	return nil
+}
+
+// 集中转发处理指令
 func (b *OrderBook) processCmd(cmd *protocol.Command) {
 	switch cmd.Type {
 	case protocol.CmdSuspendMarket:
@@ -97,9 +113,91 @@ func (b *OrderBook) processCmd(cmd *protocol.Command) {
 			b.logRejectPayload("", payload.UserId, protocol.ReasonInvalidPayload, cmd.Metadata)
 			return
 		}
+		b.handleSuspendMarket(payload)
+	case protocol.CmdResumeMarket:
+		payload := &protocol.ResumeMarketCommand{}
+		if err := b.serializer.Unmarshal(cmd.Payload, &payload); err != nil {
+			b.logRejectPayload("", payload.UserId, protocol.ReasonInvalidPayload, cmd.Metadata)
+			return
+		}
+		b.handleResumeMarket(payload)
+	case protocol.CmdPlaceOrder:
+		payload := placeOrderCmdPool.Get().(*protocol.PlaceOrderCommand)
+		*payload = protocol.PlaceOrderCommand{}
+		if err := b.serializer.Unmarshal(cmd.Payload, &payload); err != nil {
+			placeOrderCmdPool.Put(payload)
+			b.logRejectPayload("", payload.UserId, protocol.ReasonInvalidPayload, cmd.Metadata)
+			return
+		}
+		if b.state != protocol.OrderBookRunning {
+			placeOrderCmdPool.Put(payload)
+			b.logRejectPayload("", payload.UserId, protocol.ReasonStateHadDone, cmd.Metadata)
+			return
+		}
+		b.handlePlaceOrder(payload)
+		placeOrderCmdPool.Put(payload)
 	}
 }
 
+// 下单
+func (b *OrderBook) PlaceOrder(cmd *protocol.PlaceOrderCommand) error {
+	if b.shutDown.Load() {
+		return errors.New("order book is shutting down")
+	}
+	if len(cmd.OrderType) == 0 || len(cmd.OrderId) == 0 {
+		return errors.New("invalid order type")
+	}
+	bs, err := b.serializer.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+	input := &protocol.Command{
+		MarketId: b.marketId,
+		Type:     protocol.CmdPlaceOrder,
+		Payload:  bs,
+	}
+	return b.EnqueueCommand(input)
+}
+
+// 修改订单
+func (b *OrderBook) AmendOrder(cmd *protocol.AmendOrderCommand) error {
+	if b.shutDown.Load() {
+		return errors.New("order book is shutting down")
+	}
+	if len(cmd.OrderId) == 0 {
+		return errors.New("invalid order id")
+	}
+	bs, err := b.serializer.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+	input := &protocol.Command{
+		MarketId: b.marketId,
+		Type:     protocol.CmdAmendOrder,
+		Payload:  bs,
+	}
+	return b.EnqueueCommand(input)
+}
+
+// 撤销订单
+func (b *OrderBook) CancelOrder(cmd *protocol.CancelOrderCommand) error {
+	if b.shutDown.Load() {
+		return errors.New("order book is shutting down")
+	}
+	if len(cmd.OrderId) == 0 {
+		return errors.New("invalid order id")
+	}
+	bs, err := b.serializer.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+	input := &protocol.Command{
+		MarketId: b.marketId,
+		Type:     protocol.CmdCancelOrder,
+		Payload:  bs,
+	}
+	return b.EnqueueCommand(input)
+}
 func (b *OrderBook) logRejectPayload(orderId string, userId int64, reasonCode int32, _ map[string]string) {
 	logs := acquireLogSlice()
 	log := NewRejectLog(b.seqId.Add(1), b.marketId, orderId, userId, reasonCode, time.Now().Unix())
@@ -109,11 +207,70 @@ func (b *OrderBook) logRejectPayload(orderId string, userId int64, reasonCode in
 	releaseLogSlice(logs)
 }
 
-// updates the order book state to Suspended.
+// 暂停
 func (b *OrderBook) handleSuspendMarket(bean *protocol.SuspendMarketCommand) {
 	if b.state == protocol.OrderBookStop {
 		b.logRejectPayload("", bean.UserId, protocol.ReasonStateHadDone, nil)
 		return
 	}
 	b.state = protocol.OrderBookPause
+}
+
+// 恢复
+func (b *OrderBook) handleResumeMarket(bean *protocol.ResumeMarketCommand) {
+	if b.state == protocol.OrderBookStop {
+		b.logRejectPayload("", bean.UserId, protocol.ReasonStateHadDone, nil)
+		return
+	}
+	b.state = protocol.OrderBookRunning
+}
+
+// 处理下单指令
+func (b *OrderBook) handlePlaceOrder(bean *protocol.PlaceOrderCommand) {
+	price, err := udecimal.Parse(bean.Price)
+	if err != nil {
+		b.logRejectPayload(bean.OrderId, bean.UserId, protocol.ReasonInvalidPayload, nil)
+		return
+	}
+	size, err := udecimal.Parse(bean.Size)
+	if err != nil {
+		b.logRejectPayload(bean.OrderId, bean.UserId, protocol.ReasonInvalidPayload, nil)
+		return
+	}
+	visibleLimit, _ := udecimal.Parse(bean.VisibleLimit)
+	quoteSize, _ := udecimal.Parse(bean.QuoteSize)
+	//repeat orde
+	if b.bidQueue.GetOrder(bean.OrderId) != nil || b.askQueue.GetOrder(bean.OrderId) != nil {
+		b.logRejectPayload(bean.OrderId, bean.UserId, protocol.ReasonDuplicateOrderID, nil)
+		return
+	}
+	order := getOrderFromPool()
+	order.Id = bean.OrderId
+	order.Side = bean.Side
+	order.Price = price
+	order.Size = size
+	order.OrderType = bean.OrderType
+	order.UserId = bean.UserId
+	order.Timestamp = bean.Timestamp
+	if visibleLimit.GreaterThan(udecimal.Zero) && visibleLimit.LessThan(size) {
+		order.VisibleLimit = visibleLimit
+	}
+	switch order.OrderType {
+	case protocol.TypeMarket:
+		b.processMarketOrder(order, quoteSize)
+	case protocol.TypeLimit:
+		b.processLimitOrder(order)
+	default:
+
+	}
+}
+
+// 处理市价单
+func (b *OrderBook) processMarketOrder(order *protocol.Order, quoteSize udecimal.Decimal) {
+
+}
+
+// 处理限价单
+func (b *OrderBook) processLimitOrder(order *protocol.Order) {
+
 }
