@@ -107,6 +107,20 @@ func NewOpenLog(seqId int64, marketId string, orderId string, userId int64, side
 	return log
 }
 
+/*
+ *@param seqId
+* @param tradeId
+* @param marketId
+* @param orderId
+* @param takerUserId 撮合订单用户
+* @param takerSide
+* @param takerType
+* @param makerId 被撮合订单ID
+* @param makerUserId 被撮合挂单用户
+* @param price
+* @param size
+* @param timestamp
+*/
 func NewMatchLog(seqId int64, tradeId int64, marketId string,
 	orderId string, takerUserId int64, takerSide protocol.Side, takerType protocol.OrderType,
 	makerId string, makerUserId int64,

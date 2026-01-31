@@ -47,7 +47,7 @@ var DefaultLotSize = udecimal.MustFromInt64(1, 8)
 
 type OrderBook struct {
 	marketId          string           //交易对ID
-	lotSize           udecimal.Decimal //交易对最低交易单位
+	lowSize           udecimal.Decimal //交易对最低交易单位
 	seqId             atomic.Int64     //全局ID
 	lastCmdSeqId      atomic.Int64     //最后一次处理指令ID
 	tradeId           atomic.Int64     //交易ID
@@ -66,7 +66,7 @@ type OrderBookOption func(*OrderBook)
 func NewOrderBook(marketId string, tradeLog PushLog, opts ...OrderBookOption) *OrderBook {
 	book := &OrderBook{
 		marketId:          marketId,
-		lotSize:           DefaultLotSize,
+		lowSize:           DefaultLotSize,
 		bidQueue:          NewBuyerQueue(),
 		askQueue:          NewSellerQueue(),
 		done:              make(chan struct{}),
@@ -263,14 +263,98 @@ func (b *OrderBook) handlePlaceOrder(bean *protocol.PlaceOrderCommand) {
 	default:
 
 	}
+	releaseOrder(order)
 }
 
-// 处理市价单
-func (b *OrderBook) processMarketOrder(order *protocol.Order, quoteSize udecimal.Decimal) {
-
+// 处理市价单，按数量或按金额
+func (b *OrderBook) processMarketOrder(order *protocol.Order, quoteSize udecimal.Decimal) *[]*OrderBookLog {
+	var targetQueue *queue
+	if order.Side == protocol.Buy {
+		targetQueue = b.askQueue
+	} else {
+		targetQueue = b.bidQueue
+	}
+	logs := acquireLogSlice()
+	for {
+		tempOrder := targetQueue.PeakHeadOrder()
+		if tempOrder == nil {
+			//havent order
+			log := NewRejectLog(b.seqId.Add(1), b.marketId, order.Id, order.UserId, protocol.ReasonNoLiquidity, order.Timestamp)
+			log.Side = order.Side
+			if order.OrderType == protocol.TypeMarket && !quoteSize.IsZero() {
+				log.Size = quoteSize.String()
+			} else {
+				log.Size = order.Size.String()
+			}
+			log.Price = order.Price.String()
+			log.OrderType = order.OrderType
+			*logs = append(*logs, log)
+			break
+		}
+		matchSize := order.Size
+		useQuote := matchSize.IsZero() && order.OrderType == protocol.TypeMarket && !quoteSize.IsZero()
+		if useQuote {
+			//按金额 根据对手盘计算能换多少量 金额/价格
+			matchSize, _ = quoteSize.Div(tempOrder.Price)
+		}
+		if matchSize.GreaterThan(tempOrder.Size) {
+			matchSize = tempOrder.Size
+		}
+		//check low size
+		if matchSize.LessThan(b.lowSize) {
+			log := NewRejectLog(b.seqId.Add(1), b.marketId, order.Id, order.UserId, protocol.ReasonLowSize, order.Timestamp)
+			log.Side = order.Side
+			if order.OrderType == protocol.TypeMarket && !quoteSize.IsZero() {
+				log.Size = quoteSize.String()
+			} else {
+				log.Size = order.Size.String()
+			}
+			log.Price = order.Price.String()
+			log.OrderType = order.OrderType
+			*logs = append(*logs, log)
+			break
+		}
+		log := NewMatchLog(b.seqId.Add(1), b.tradeId.Add(1), b.marketId, order.Id, order.UserId, order.Side, order.OrderType, tempOrder.Id, tempOrder.UserId, tempOrder.Price, matchSize, order.Timestamp)
+		*logs = append(*logs, log)
+		if useQuote {
+			quoteSize = quoteSize.Sub(matchSize.Mul(tempOrder.Price))
+		} else {
+			order.Size = order.Size.Sub(matchSize)
+		}
+		tempOrder = targetQueue.PopHeadOrder()
+		if matchSize.Equal(tempOrder.Size) {
+			//完全成交，冰山单？
+			b.checkIcebergOrder(order, targetQueue, logs)
+		} else {
+			tempOrder.Size = tempOrder.Size.Sub(matchSize)
+			targetQueue.PutOrder(tempOrder, true)
+		}
+		if useQuote && quoteSize.IsZero() || (!useQuote && order.Size.IsZero()) {
+			break
+		}
+	}
+	return logs
 }
 
 // 处理限价单
 func (b *OrderBook) processLimitOrder(order *protocol.Order) {
 
+}
+
+// 检查冰山订单，如果是冰山订单补货后加入队列尾部
+func (b *OrderBook) checkIcebergOrder(order *protocol.Order, queue *queue, logs *[]*OrderBookLog) bool {
+	if order.HiddenSize.GreaterThan(udecimal.Zero) {
+		limit := order.VisibleLimit
+		if order.HiddenSize.LessThan(limit) {
+			limit = order.HiddenSize
+		}
+		order.Size = limit
+		order.HiddenSize = order.HiddenSize.Sub(limit)
+		queue.PutOrder(order, false)
+
+		log := NewOpenLog(b.seqId.Add(1), b.marketId, order.Id, order.UserId, order.Side, order.Price, order.Size, order.OrderType, order.Timestamp)
+		*logs = append(*logs, log)
+		return true
+	}
+	return false
 }

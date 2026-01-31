@@ -163,4 +163,6 @@ const (
 	ReasonInvalidPayload              = 100
 	ReasonStateHadDone                = 101
 	ReasonDuplicateOrderID            = 102
+	ReasonNoLiquidity                 = 103
+	ReasonLowSize                     = 104
 )
