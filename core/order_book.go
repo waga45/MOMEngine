@@ -336,9 +336,55 @@ func (b *OrderBook) processMarketOrder(order *protocol.Order, quoteSize udecimal
 	return logs
 }
 
-// 处理限价单
-func (b *OrderBook) processLimitOrder(order *protocol.Order) {
-
+// 处理限价单，满足条件就吃，否则直接挂单
+func (b *OrderBook) processLimitOrder(order *protocol.Order) *[]*OrderBookLog {
+	var orderQueue, targetQueue *queue
+	if order.Side == protocol.Buy {
+		targetQueue = b.askQueue
+		orderQueue = b.bidQueue
+	} else {
+		targetQueue = b.bidQueue
+		orderQueue = b.askQueue
+	}
+	logs := acquireLogSlice()
+	for {
+		tempOrder := targetQueue.PeakHeadOrder()
+		if tempOrder == nil {
+			//no target, put to order queue
+			orderQueue.PutOrder(order, false)
+			log := NewOpenLog(b.seqId.Add(1), b.marketId, order.Id, order.UserId, order.Side, order.Price, order.Size, order.OrderType, order.Timestamp)
+			*logs = append(*logs, log)
+			break
+		}
+		if (order.Side == protocol.Buy && order.Price.LessThan(tempOrder.Price)) ||
+			(order.Side == protocol.Sell && order.Price.GreaterThan(tempOrder.Price)) {
+			orderQueue.PutOrder(order, false)
+			log := NewOpenLog(b.seqId.Add(1), b.marketId, order.Id, order.UserId, order.Side, order.Price, order.Size, order.OrderType, order.Timestamp)
+			*logs = append(*logs, log)
+			break
+		}
+		tempOrder = targetQueue.PopHeadOrder()
+		if order.Size.GreaterThanOrEqual(tempOrder.Size) {
+			//足够
+			log := NewMatchLog(b.seqId.Add(1), b.tradeId.Add(1), b.marketId, order.Id, order.UserId, order.Side, order.OrderType, tempOrder.Id, tempOrder.UserId, tempOrder.Price, tempOrder.Size, order.Timestamp)
+			*logs = append(*logs, log)
+			order.Size = order.Size.Sub(tempOrder.Size)
+			if !b.checkIcebergOrder(tempOrder, targetQueue, logs) {
+				releaseOrder(tempOrder)
+			}
+			if order.Size.Equal(udecimal.Zero) {
+				break
+			}
+		} else {
+			//not enough
+			log := NewMatchLog(b.seqId.Add(1), b.tradeId.Add(1), b.marketId, order.Id, order.UserId, order.Side, order.OrderType, tempOrder.Id, tempOrder.UserId, tempOrder.Price, order.Size, order.Timestamp)
+			*logs = append(*logs, log)
+			tempOrder.Size = tempOrder.Size.Sub(order.Size)
+			targetQueue.PutOrder(tempOrder, true)
+			break
+		}
+	}
+	return logs
 }
 
 // 检查冰山订单，如果是冰山订单补货后加入队列尾部
